@@ -11,6 +11,9 @@ test_init_fresh_repo() {
   assert_eq '@AGENTS.md' "$(head -n1 CLAUDE.md)"
   assert_eq 1 "$(grep -cF 'agentkit:begin' CLAUDE.md)"
   assert_eq 1 "$(grep -cF 'agentkit:end' CLAUDE.md)"
+  assert_contains AGENTS.md 'Builders (Codex, complex-implementer) never commit'
+  assert_contains CLAUDE.md 'agentkit codex <unit>'
+  assert_contains CLAUDE.md 'agentkit wt <B> agent/<A>'
   settings_check 's.model === "opus" && s.enabledPlugins["codex@openai-codex"] === true && s.extraKnownMarketplaces["openai-codex"].source.repo === "openai/codex-plugin-cc"'
   assert_line .gitignore '.worktrees/'
 }
@@ -52,6 +55,46 @@ test_init_preserves_existing_agents_and_claude_content() {
   assert_same "$SANDBOX/original-claude" "$SANDBOX/kept-claude"
   assert_eq 1 "$(grep -cF 'agentkit:begin' CLAUDE.md)"
   [[ ! -e CLAUDE.md.agentkit-backup ]] || fail 'Existing AGENTS should prevent migration'
+}
+
+test_init_replaces_claude_symlink_to_agents() {
+  printf '# Shared rules\nKeep these bytes, including the final newline.\n' > AGENTS.md
+  cp AGENTS.md "$SANDBOX/original-agents"
+  ln -s AGENTS.md CLAUDE.md
+  kit_ok init
+  [[ -f CLAUDE.md && ! -L CLAUDE.md ]] || fail 'CLAUDE.md must become a regular file'
+  assert_eq '@AGENTS.md' "$(head -n1 CLAUDE.md)"
+  assert_eq 1 "$(grep -cF 'agentkit:begin' CLAUDE.md)"
+  assert_same "$SANDBOX/original-agents" AGENTS.md
+  if grep -qE 'agentkit:begin|@AGENTS\.md' AGENTS.md; then
+    fail 'Orchestration instructions leaked into AGENTS.md'
+  fi
+}
+
+test_init_rejects_agents_symlink() {
+  printf '# User instructions\nKeep exactly these bytes.' > CLAUDE.md
+  cp CLAUDE.md "$SANDBOX/original-claude"
+  ln -s CLAUDE.md AGENTS.md
+  kit_fails init
+  assert_contains "$SANDBOX/stderr" 'AGENTS.md is a symlink'
+  [[ -L AGENTS.md ]] || fail 'AGENTS.md symlink was replaced'
+  assert_eq CLAUDE.md "$(readlink AGENTS.md)"
+  assert_same "$SANDBOX/original-claude" CLAUDE.md
+  assert_same "$SANDBOX/original-claude" AGENTS.md
+}
+
+test_init_rejects_claude_symlink_to_other_file() {
+  printf '# Shared rules\n' > AGENTS.md
+  printf '# Other instructions\nKeep these bytes.' > other.md
+  cp AGENTS.md "$SANDBOX/original-agents"
+  cp other.md "$SANDBOX/original-other"
+  ln -s other.md CLAUDE.md
+  kit_fails init
+  assert_contains "$SANDBOX/stderr" 'CLAUDE.md is a symlink'
+  [[ -L CLAUDE.md ]] || fail 'CLAUDE.md symlink was replaced'
+  assert_eq other.md "$(readlink CLAUDE.md)"
+  assert_same "$SANDBOX/original-other" other.md
+  assert_same "$SANDBOX/original-agents" AGENTS.md
 }
 
 test_init_preserves_user_reviewer() {
@@ -120,6 +163,36 @@ test_trust_existing_single_quoted_key_not_duplicated() {
   cp "$CODEX_HOME/config.toml" "$SANDBOX/trust"
   kit_ok init
   assert_same "$SANDBOX/trust" "$CODEX_HOME/config.toml"
+}
+
+test_trust_untrusted_is_preserved_and_doctor_reports_missing() {
+  printf '[projects."%s"]\ntrust_level = "untrusted"\n' "$REPO" > "$CODEX_HOME/config.toml"
+  cp "$CODEX_HOME/config.toml" "$SANDBOX/trust"
+  kit_ok init
+  assert_contains "$SANDBOX/stderr" 'trust_level=untrusted'
+  assert_eq 1 "$(grep -cxF "[projects.\"$REPO\"]" "$CODEX_HOME/config.toml")"
+  assert_same "$SANDBOX/trust" "$CODEX_HOME/config.toml"
+  capture "$KIT_DIR/agentkit" doctor
+  assert_line "$SANDBOX/stdout" '  MISS  codex trusts project'
+}
+
+test_trust_trailing_comment_is_trusted() {
+  printf '[projects."%s"]\ntrust_level = "trusted" # user choice\n' "$REPO" > "$CODEX_HOME/config.toml"
+  cp "$CODEX_HOME/config.toml" "$SANDBOX/trust"
+  kit_ok init
+  assert_same "$SANDBOX/trust" "$CODEX_HOME/config.toml"
+  capture "$KIT_DIR/agentkit" doctor
+  assert_line "$SANDBOX/stdout" '  ok    codex trusts project'
+}
+
+test_trust_does_not_leak_from_following_table() {
+  printf '[projects."%s"]\n# no trust level here\n[projects."/other"]\ntrust_level = "trusted"\n' \
+    "$REPO" > "$CODEX_HOME/config.toml"
+  cp "$CODEX_HOME/config.toml" "$SANDBOX/trust"
+  kit_ok init
+  assert_same "$SANDBOX/trust" "$CODEX_HOME/config.toml"
+  capture "$KIT_DIR/agentkit" doctor
+  assert_line "$SANDBOX/stdout" '  MISS  codex trusts project'
 }
 
 test_init_from_linked_worktree_configures_main_checkout() {
@@ -262,12 +335,8 @@ test_wt_unknown_option_fails() {
   assert_contains "$SANDBOX/stderr" 'unknown option --unknown'
 }
 
-test_wt_explicit_base_prefers_origin_ref() {
-  commit_fixture
-  local local_commit remote_commit
-  local_commit=$(git rev-parse HEAD)
-  git branch release
-  git init --quiet --bare --initial-branch=fixture-base "$SANDBOX/origin.git"
+origin_with_newer_release() {
+  git init --quiet --bare --initial-branch=release "$SANDBOX/origin.git"
   git remote add origin "$SANDBOX/origin.git"
   git push --quiet origin fixture-base:release
   # Build a newer remote release in a local clone, leaving local release behind.
@@ -275,13 +344,127 @@ test_wt_explicit_base_prefers_origin_ref() {
   printf 'remote release\n' > "$SANDBOX/publisher/remote.txt"
   git -C "$SANDBOX/publisher" add remote.txt
   git -C "$SANDBOX/publisher" commit --quiet -m 'Remote release fixture'
-  remote_commit=$(git -C "$SANDBOX/publisher" rev-parse HEAD)
   git -C "$SANDBOX/publisher" push --quiet origin release
+  git fetch --quiet origin
+  git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/release
+}
+
+test_wt_explicit_base_used_as_given() {
+  commit_fixture
+  local local_commit remote_commit
+  local_commit=$(git rev-parse HEAD)
+  git branch release
+  origin_with_newer_release
+  remote_commit=$(git rev-parse origin/release)
   [[ "$local_commit" != "$remote_commit" ]] || fail 'Origin fixture did not diverge'
-  kit_ok wt remote-unit release --no-install
-  assert_eq "$remote_commit" "$(git -C "$REPO/.worktrees/remote-unit" rev-parse HEAD)"
+  kit_ok wt u release
+  assert_eq "$local_commit" "$(git -C "$REPO/.worktrees/u" rev-parse HEAD)"
+  assert_eq 'agent/u' "$(git -C "$REPO/.worktrees/u" branch --show-current)"
   assert_eq "$local_commit" "$(git rev-parse release)"
+  assert_contains "$SANDBOX/stderr" '(from release)'
+  kit_ok wt v origin/release
+  assert_eq "$remote_commit" "$(git -C "$REPO/.worktrees/v" rev-parse HEAD)"
+  assert_eq 'agent/v' "$(git -C "$REPO/.worktrees/v" branch --show-current)"
   assert_contains "$SANDBOX/stderr" '(from origin/release)'
+}
+
+test_wt_default_base_is_current_branch() {
+  commit_fixture
+  origin_with_newer_release
+  git checkout --quiet -b feature
+  printf 'feature\n' > feature.txt
+  git add feature.txt
+  git commit --quiet -m 'Feature fixture'
+  local feature_commit
+  feature_commit=$(git rev-parse HEAD)
+  [[ "$feature_commit" != "$(git rev-parse origin/HEAD)" ]] || fail 'Origin HEAD must differ'
+  kit_ok wt u
+  assert_eq "$feature_commit" "$(git -C "$REPO/.worktrees/u" rev-parse HEAD)"
+  assert_contains "$SANDBOX/stderr" '(from feature)'
+}
+
+test_wt_chained_base() {
+  commit_fixture
+  kit_ok wt a
+  printf 'unit a\n' > "$REPO/.worktrees/a/unit-a.txt"
+  git -C "$REPO/.worktrees/a" add unit-a.txt
+  git -C "$REPO/.worktrees/a" commit --quiet -m 'Unit A fixture'
+  local a_commit
+  a_commit=$(git -C "$REPO/.worktrees/a" rev-parse HEAD)
+  [[ "$a_commit" != "$(git rev-parse HEAD)" ]] || fail 'Unit A must have its own commit'
+  kit_ok wt b agent/a
+  assert_eq "$a_commit" "$(git -C "$REPO/.worktrees/b" rev-parse HEAD)"
+  assert_contains "$SANDBOX/stderr" '(from agent/a)'
+}
+
+# Each line records the executable, its cwd, then each argument separately.
+record_installers() {
+  export INSTALL_LOG="$SANDBOX/install.log"
+  : > "$INSTALL_LOG"
+  local manager
+  for manager in npm pnpm yarn go uv pip poetry; do
+    cat > "$SANDBOX/bin/$manager" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "${0##*/}" "$PWD" "$@" >> "$INSTALL_LOG"
+SH
+    chmod +x "$SANDBOX/bin/$manager"
+  done
+}
+
+test_wt_installs_go_dependencies() {
+  record_installers
+  printf 'module example.invalid/fixture\n' > go.mod
+  commit_fixture
+  kit_ok wt u
+  printf '%s\n' go "$REPO/.worktrees/u" mod download > "$SANDBOX/expected-install"
+  assert_same "$SANDBOX/expected-install" "$INSTALL_LOG"
+}
+
+test_wt_installs_uv_dependencies() {
+  record_installers
+  touch pyproject.toml uv.lock
+  commit_fixture
+  kit_ok wt u
+  printf '%s\n' uv "$REPO/.worktrees/u" sync > "$SANDBOX/expected-install"
+  assert_same "$SANDBOX/expected-install" "$INSTALL_LOG"
+}
+
+test_wt_requirements_warns_without_installing() {
+  record_installers
+  printf 'fixture-package==1.0\n' > requirements.txt
+  commit_fixture
+  kit_ok wt u
+  [[ ! -s "$INSTALL_LOG" ]] || fail 'requirements.txt triggered an install'
+  assert_contains "$SANDBOX/stderr" "not running 'pip install"
+}
+
+test_wt_no_install_skips_dependencies() {
+  record_installers
+  printf '.worktrees/\n' > .gitignore
+  # Exercise every supported installer and the pip warning path independently.
+  local fixture unit=0
+  for fixture in npm pnpm yarn go uv requirements; do
+    rm -f package.json package-lock.json pnpm-lock.yaml yarn.lock go.mod pyproject.toml uv.lock requirements.txt
+    case "$fixture" in
+      npm|pnpm|yarn)
+        printf '{}\n' > package.json
+        case "$fixture" in
+          npm) touch package-lock.json ;;
+          pnpm) touch pnpm-lock.yaml ;;
+          yarn) touch yarn.lock ;;
+        esac ;;
+      go) printf 'module example.invalid/fixture\n' > go.mod ;;
+      uv) touch pyproject.toml uv.lock ;;
+      requirements) touch requirements.txt ;;
+    esac
+    commit_fixture
+    unit=$((unit + 1))
+    kit_ok wt "u$unit" --no-install
+    [[ ! -s "$INSTALL_LOG" ]] || fail "--no-install ran an installer for $fixture"
+    if grep -qE 'installing dependencies|not running .pip install' "$SANDBOX/stderr"; then
+      fail "--no-install entered dependency handling for $fixture"
+    fi
+  done
 }
 
 test_rm_clean_worktree_keeps_branch() {
@@ -299,6 +482,18 @@ test_rm_missing_worktree_fails() {
   commit_fixture
   kit_fails rm missing
   assert_contains "$SANDBOX/stderr" 'no worktree at'
+}
+
+test_rm_dirty_worktree_is_kept() {
+  commit_fixture
+  kit_ok wt dirty --no-install
+  printf 'uncommitted change\n' >> "$REPO/.worktrees/dirty/fixture.txt"
+  cp "$REPO/.worktrees/dirty/fixture.txt" "$SANDBOX/dirty-fixture"
+  kit_fails rm dirty
+  [[ -d "$REPO/.worktrees/dirty" ]] || fail 'Dirty worktree directory was removed'
+  assert_same "$SANDBOX/dirty-fixture" "$REPO/.worktrees/dirty/fixture.txt"
+  git worktree list --porcelain | grep -qxF "worktree $REPO/.worktrees/dirty" ||
+    fail 'Dirty worktree is no longer registered'
 }
 
 test_doctor_after_init_project_checks_all_ok() {
