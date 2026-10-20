@@ -5,6 +5,10 @@
 #   agentkit init [dir]                    once per project (re-run any time to update)
 #   agentkit wt <name> [base] [--no-install]
 #                                          create a unit worktree under .worktrees/
+#   agentkit codex <name> [--resume] [--model m] [--effort e] [prompt...]
+#                                          run Codex (via the plugin) inside a unit worktree;
+#                                          prompt from args, --prompt-file <f>, or stdin
+#   agentkit codex <name> status|result|cancel [args]
 #   agentkit rm <name>                     remove a unit worktree (keeps its branch)
 #   agentkit doctor [dir]                  check machine + project setup
 #   agentkit version
@@ -22,6 +26,7 @@ CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 MARK="managed by agentkit"
 PLUGIN="codex@openai-codex"
 PLUGIN_REPO="openai/codex-plugin-cc"
+PLUGIN_CACHE="$HOME/.claude/plugins/cache/openai-codex/codex"
 
 # All log output goes to stderr so stdout stays clean for data (e.g. `agentkit wt`).
 say()  { printf '\033[1;34m[agentkit]\033[0m %s\n' "$*" >&2; }
@@ -139,11 +144,16 @@ Show me the plan and a route table (unit -> Codex or complex-implementer)
 and wait for approval before delegating.
 
 ### 2. Route each unit
-Default: delegate to the codex:codex-rescue subagent (Agent tool,
-subagent_type "codex:codex-rescue", run in the background). Start the prompt
-with "--wait --fresh" so the result comes back to you when Codex finishes.
-Give it: the absolute worktree path (tell Codex to edit only inside it),
-acceptance criteria, files, test command, and the do-not-touch list.
+Default: Codex. Run it with Bash in the background (run_in_background: true):
+  agentkit codex <unit> <<'TASK'
+  <unit spec>
+  TASK
+This drives the Codex plugin with the unit's worktree as Codex's workspace,
+so Codex can write only there and runs its commands there. The output ends
+with Codex's final message when the job finishes. Do not use the
+codex:codex-rescue subagent for units: it always runs Codex in the main
+checkout. The unit spec gives: acceptance criteria, files, test command, the
+do-not-touch list, and "leave changes uncommitted".
 
 Use the complex-implementer subagent instead if ANY is true:
 - changes a contract or schema shared between services
@@ -154,24 +164,27 @@ Use the complex-implementer subagent instead if ANY is true:
 
 ### 3. Run
 Create each unit's worktree with: agentkit wt <ticket>-<slug> [base]
-(it prints the worktree path and installs dependencies, because Codex runs
-with network off). Independent units run in parallel, each in its own
-worktree. Dependent units run in order.
+It prints the worktree path on stdout and logs "from <base>" on stderr; that
+exact base is the one the reviewer diffs against. It also installs
+dependencies, because Codex runs with network off.
+Independent units run in parallel, each in its own worktree. A dependent
+unit B starts only after unit A has passed review and been committed, from
+A's branch: agentkit wt <B> agent/<A>
 Codex cannot write inside .git, so builders leave changes uncommitted.
 
 ### 4. Review loop
 After each unit, run the reviewer subagent with the criteria, base branch
 and worktree path.
-- PASS: commit the unit on its agent/ branch
+- PASS: you (the orchestrator) commit the unit on its agent/ branch
   (git -C <worktree> add -A && git -C <worktree> commit -m "<ticket>: <unit>").
-- FIX: send the findings back to Codex. Max 2 rounds. Use "--wait --resume"
-  only if this unit was the most recent Codex task in the repo; otherwise use
-  "--wait --fresh" and resend the unit spec plus the findings.
+- FIX: send the findings back with: agentkit codex <unit> --resume <<'TASK'
+  (the thread is per worktree, so parallel units never mix). Max 2 rounds.
 - ESCALATE, or a third failure: hand the unit to complex-implementer.
 
 ### 5. Report
 Per unit: who built it, review verdict, tests run, diff summary.
 Never merge, never push to main. I raise the PR.
+Clean up after the PR merges with: agentkit rm <unit>
 Never enable the Codex review gate (/codex:setup --enable-review-gate).
 EOF
 }
@@ -242,7 +255,8 @@ $STACK
 - Make the smallest change that meets the acceptance criteria.
 - Every bug fix starts with a failing test that reproduces it.
 - Never read or print .env files or secrets.
-- Never commit, push, merge, or touch the main branch; leave changes uncommitted for review.
+- Builders (Codex, complex-implementer) never commit, push or merge; leave changes uncommitted for review.
+- Never push to or change the main branch.
 - Finish by listing files changed and the test output.
 EOF
 }
@@ -312,16 +326,36 @@ gitignore_add() {
   say "added $line to .gitignore"
 }
 
+# Print the trust_level Codex has for project $1: trusted, untrusted, "set" when
+# the table exists without a trust_level, or nothing when there is no entry.
+trust_state() {
+  local dir="$1" gcfg="$CODEX_HOME/config.toml"
+  [[ -f "$gcfg" ]] || return 0
+  awk -v h1="[projects.\"$dir\"]" -v h2="[projects.'$dir']" '
+    { line=$0; sub(/[ \t]+$/, "", line) }
+    line==h1 || line==h2 { inside=1; found=1; next }
+    /^[ \t]*\[/ { if (inside) exit; next }
+    inside && /^[ \t]*trust_level[ \t]*=/ {
+      v=$0; sub(/^[^=]*=[ \t]*/, "", v); gsub(/["\047 \t]/, "", v); sub(/#.*/, "", v); print v; done=1; exit
+    }
+    END { if (found && !done) print "set" }
+  ' "$gcfg"
+}
+
 # Mark $1 as trusted in the global Codex config so its .codex/config.toml is honoured.
 trust_project() {
-  local dir="$1" gcfg="$CODEX_HOME/config.toml"
+  local dir="$1" gcfg="$CODEX_HOME/config.toml" state
   # shellcheck disable=SC1003
   if [[ "$dir" == *'"'* || "$dir" == *'\'* ]]; then
     warn "path contains quotes or backslashes; trust $dir in Codex by hand"
     return 0
   fi
   mkdir -p "$CODEX_HOME"; touch "$gcfg"
-  if grep -qF "[projects.\"$dir\"]" "$gcfg" || grep -qF "[projects.'$dir']" "$gcfg"; then
+  state="$(trust_state "$dir")"
+  if [[ "$state" == "trusted" ]]; then
+    return 0
+  elif [[ -n "$state" ]]; then
+    warn "Codex has trust_level=$state for $dir in $gcfg; set it to \"trusted\" or .codex/config.toml is ignored"
     return 0
   fi
   [[ ! -s "$gcfg" || -z "$(tail -c1 "$gcfg")" ]] || printf '\n' >> "$gcfg"
@@ -336,8 +370,21 @@ cmd_init() {
   have node || die "Node.js is required"
   say "setting up $dir"
 
-  # 1. AGENTS.md: one shared instructions file. Absorb an existing CLAUDE.md.
   local agents="$dir/AGENTS.md" claude_md="$dir/CLAUDE.md"
+  # The rules written to CLAUDE.md must never reach AGENTS.md (Codex reads it).
+  if [[ -L "$agents" ]]; then
+    die "AGENTS.md is a symlink; make it a regular file and re-run"
+  fi
+  if [[ -L "$claude_md" ]]; then
+    if [[ -f "$agents" && "$(readlink -f "$claude_md")" == "$(readlink -f "$agents")" ]]; then
+      rm "$claude_md"
+      say "replaced the CLAUDE.md -> AGENTS.md symlink with a file that imports AGENTS.md"
+    else
+      die "CLAUDE.md is a symlink; make it a regular file and re-run"
+    fi
+  fi
+
+  # 1. AGENTS.md: one shared instructions file. Absorb an existing CLAUDE.md.
   if [[ ! -f "$agents" ]]; then
     local own=""
     if [[ -f "$claude_md" ]] && ! grep -qF "$MARK" "$claude_md"; then
@@ -424,21 +471,22 @@ cmd_wt() {
   if git -C "$root" remote get-url origin >/dev/null 2>&1; then
     git -C "$root" fetch --quiet origin 2>/dev/null || warn "git fetch origin failed; using local refs"
   fi
-  if [[ -z "$base" ]]; then
-    base="$(git -C "$root" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
-    [[ -n "$base" ]] || base="$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)"
-  elif git -C "$root" show-ref --verify --quiet "refs/remotes/origin/$base"; then
-    base="origin/$base"
-  fi
+  # Default base: the branch checked out in the main checkout. An explicit base
+  # is used exactly as given, so the reviewer can diff against the same ref.
+  [[ -n "$base" ]] || base="$(git -C "$root" symbolic-ref --quiet --short HEAD 2>/dev/null || echo HEAD)"
   git -C "$root" rev-parse --verify --quiet "$base^{commit}" >/dev/null || die "base '$base' does not exist"
 
   git -C "$root" worktree add --quiet "$path" -b "agent/$name" "$base" >&2
   say "worktree $path on agent/$name (from $base)"
 
-  if (( install )) && [[ -f "$path/package.json" ]]; then
+  if (( install )); then
     local cmd; cmd="$(detect_commands "$path" | sed -n 's/^INSTALL=//p')"
-    say "installing dependencies: $cmd"
-    (cd "$path" && $cmd) >&2 || warn "dependency install failed; run '$cmd' in $path"
+    case "$cmd" in
+      TODO*|"") ;;
+      pip\ *) warn "not running '$cmd' (it would install into a shared Python); set up an environment in $path yourself" ;;
+      *) say "installing dependencies: $cmd"
+         (cd "$path" && $cmd) >&2 || warn "dependency install failed; run '$cmd' in $path" ;;
+    esac
   fi
   printf '%s\n' "$path"
 }
@@ -449,8 +497,51 @@ cmd_rm() {
   local root; root="$(repo_root .)" || die "not inside a git repository"
   local path="$root/.worktrees/$name"
   [[ -d "$path" ]] || die "no worktree at $path"
-  git -C "$root" worktree remove "$path" || die "worktree has uncommitted changes; commit them or remove it by hand"
+  git -C "$root" worktree remove "$path" || die "could not remove $path (see git's message above)"
   say "removed $path (branch agent/$name kept)"
+}
+
+# Newest installed copy of the Codex plugin's companion script.
+companion_path() {
+  if [[ -n "${AGENTKIT_COMPANION:-}" ]]; then printf '%s\n' "$AGENTKIT_COMPANION"; return 0; fi
+  local f
+  f="$(find "$PLUGIN_CACHE" -mindepth 3 -maxdepth 3 -path '*/scripts/codex-companion.mjs' 2>/dev/null | sort -V | tail -n1)"
+  [[ -n "$f" ]] || return 1
+  printf '%s\n' "$f"
+}
+
+cmd_codex() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: agentkit codex <name> [--resume] [--model m] [--effort e] [--prompt-file f | prompt...]"
+  shift
+  local root path comp
+  root="$(repo_root .)" || die "not inside a git repository"
+  path="$root/.worktrees/$name"
+  [[ -d "$path" ]] || die "no worktree at $path (create it with: agentkit wt $name)"
+  comp="$(companion_path)" || die "Codex plugin not found under $PLUGIN_CACHE (run: agentkit install)"
+  # Share job state with /codex:status inside Claude Code.
+  export CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/codex-openai-codex}"
+
+  case "${1:-}" in
+    status|result|cancel) local sub="$1"; shift; exec node "$comp" "$sub" --cwd "$path" "$@" ;;
+  esac
+
+  local args=(task --write --cwd "$path") prompt=()
+  while (( $# )); do
+    case "$1" in
+      --resume) args+=(--resume-last) ;;
+      --model|--effort) [[ $# -ge 2 ]] || die "$1 needs a value"; args+=("$1" "$2"); shift ;;
+      --prompt-file)
+        [[ $# -ge 2 && -f "$2" ]] || die "--prompt-file needs an existing file"
+        args+=(--prompt-file "$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"); shift ;;
+      --) shift; prompt+=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *) prompt+=("$1") ;;
+    esac
+    shift
+  done
+  say "Codex task in $path"
+  exec node "$comp" "${args[@]}" "${prompt[@]}"
 }
 
 cmd_doctor() {
@@ -463,7 +554,7 @@ cmd_doctor() {
   first_line_imports() { head -n1 "$1" | grep -qE '^@AGENTS\.md[[:space:]]*$'; }
   claude_auth()   { [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]] || claude auth status 2>/dev/null | grep -q '"loggedIn": *true'; }
   plugin_ready()  { claude plugin list 2>/dev/null | grep -qF "$PLUGIN"; }
-  codex_trusted() { grep -qF "[projects.\"$dir\"]" "$CODEX_HOME/config.toml" || grep -qF "[projects.'$dir']" "$CODEX_HOME/config.toml"; }
+  codex_trusted() { [[ "$(trust_state "$dir")" == "trusted" ]]; }
 
   echo "machine:"
   check "node >= 18.18"          node_ok
@@ -488,13 +579,14 @@ cmd_doctor() {
   return "$fail"
 }
 
-usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   init)    shift; cmd_init "$@" ;;
   wt)      shift; cmd_wt "$@" ;;
   rm)      shift; cmd_rm "$@" ;;
+  codex)   shift; cmd_codex "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
   version|--version) echo "agentkit $KIT_VERSION" ;;
   help|-h|--help) usage ;;
