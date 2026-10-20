@@ -1,0 +1,11 @@
+# managed by agentkit v1.0.0
+model = "gpt-6.1-sol"
+model_reasoning_effort = "high"
+
+# Background jobs must not stop to ask for approval;
+# the sandbox is the safety boundary instead.
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = false
