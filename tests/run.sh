@@ -62,14 +62,14 @@ setup_sandbox() {
   export XDG_CONFIG_HOME="$HOME/.config" XDG_CACHE_HOME="$HOME/.cache"
   export CLAUDE_CONFIG_DIR="$HOME/.claude"
   export CLAUDE_MODEL=opus CODEX_MODEL=gpt-6.1-sol CODEX_EFFORT=high CODEX_NETWORK=false
-  unset CLAUDE_CODE_OAUTH_TOKEN
+  unset CLAUDE_CODE_OAUTH_TOKEN AGENTKIT_COMPANION CLAUDE_PLUGIN_DATA
   # Doctor may call installed CLIs. Never query a real login or plugin service.
   printf '#!/usr/bin/env bash\nexit 1\n' > "$SANDBOX/bin/claude"
   cp "$SANDBOX/bin/claude" "$SANDBOX/bin/codex"
   chmod +x "$SANDBOX/bin/claude" "$SANDBOX/bin/codex"
   # A regression in --no-install must fail locally instead of installing packages.
   local package_manager
-  for package_manager in npm pnpm yarn; do
+  for package_manager in npm pnpm yarn go uv pip poetry; do
     printf '#!/usr/bin/env bash\nprintf "Unexpected package install\\n" >&2\nexit 99\n' > "$SANDBOX/bin/$package_manager"
     chmod +x "$SANDBOX/bin/$package_manager"
   done
