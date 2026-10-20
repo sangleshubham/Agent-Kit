@@ -53,7 +53,9 @@ Set `CODEX_NETWORK=true` for a project where Codex itself must install packages.
 | --- | --- |
 | `agentkit install` | Machine setup (above). |
 | `agentkit init [dir]` | Project setup (above). Works from inside a linked worktree too; it always targets the main checkout. |
-| `agentkit wt <name> [base] [--no-install]` | Creates `.worktrees/<name>` on branch `agent/<name>` from `origin/<base>` (or `origin/HEAD`, or the current branch), installs Node dependencies there, and prints only the path on stdout. |
+| `agentkit wt <name> [base] [--no-install]` | Creates `.worktrees/<name>` on branch `agent/<name>` from `base` exactly as given (default: the branch checked out in the main checkout; pass `origin/main` to start from the remote), installs dependencies there (npm/pnpm/yarn, uv, poetry, go; bare `pip` is skipped with a warning), and prints only the path on stdout. |
+| `agentkit codex <name> [--resume] [--model m] [--effort e] [prompt...]` | Runs a Codex task through the plugin's runtime with the unit's worktree as Codex's workspace (write access there only). Prompt from args, `--prompt-file <f>`, or stdin. `--resume` continues that worktree's last Codex thread. |
+| `agentkit codex <name> status\|result\|cancel` | Job status, output or cancel for that worktree. |
 | `agentkit rm <name>` | Removes a clean unit worktree; keeps the branch. |
 | `agentkit doctor [dir]` | One line per machine and project check; exits non-zero if anything is missing. |
 
@@ -65,21 +67,32 @@ cd ~/work/<repo> && claude
 > APP-1234: <ticket text>. Plan, route, and bring every unit to review PASS.
 ```
 
-Approve the plan and route table, watch Codex with `/codex:status` and
-`/codex:result`, read the final report, then push the `agent/` branch and raise
-the PR yourself. To take over a Codex run: `codex resume <session-id>`.
+Approve the plan and route table, watch a unit with
+`agentkit codex <unit> status` (or `result`), read the final report, then push
+the `agent/` branch and raise the PR yourself. To take over a Codex run, use the
+`codex resume <session-id>` line printed at the end of its output.
 
 ## Changes from the original plan, and why
 
 - **Builders never commit.** Codex's `workspace-write` sandbox keeps `.git`
   read-only, so it cannot `git add`/`commit`. Builders leave changes uncommitted;
   the reviewer reads `git diff HEAD` and untracked files; Opus commits after PASS.
-- **`--wait` inside a background subagent.** The rules tell Opus to run
-  `codex:codex-rescue` in the background with `--wait`, so Codex's result comes
-  back when it finishes instead of a job id that has to be polled.
-- **`--resume` only for the latest job.** The plugin resumes the *most recent*
-  Codex thread in the repo, so with parallel units a FIX round resends the spec
-  plus findings with `--fresh` unless that unit was the last Codex task.
+- **Units go to Codex through `agentkit codex <unit>`, not `codex:codex-rescue`.**
+  The rescue subagent always runs Codex at the git top level of the Claude
+  session, so Codex could write to the main checkout and every other unit's
+  worktree, ran `npm test` against unchanged code, and `--resume` picked the
+  newest thread in the whole repo (or refused while any other unit was
+  running). `agentkit codex` calls the same plugin runtime with
+  `--cwd <worktree>`: Codex's sandbox, commands and resume thread are all
+  scoped to that unit. `/codex:rescue` is still there for ad-hoc questions.
+- **Dependent units chain branches.** Unit B is created from `agent/<A>` after
+  A passes review, and `wt` uses an explicit base exactly as given (no silent
+  swap to `origin/<base>`), so the reviewer diffs against the right ref.
+- **Symlinked instruction files.** A `CLAUDE.md -> AGENTS.md` symlink is
+  replaced by a real `CLAUDE.md`; a symlinked `AGENTS.md` stops `init`.
+  Otherwise the Claude-only rules would leak into the file Codex reads.
+- **Trust is read, not assumed.** A project you once marked `untrusted` in Codex
+  is reported by `init` and `doctor` instead of being treated as trusted.
 - **`wt` installs dependencies.** Codex runs with network off, so a fresh
   worktree would have no `node_modules`.
 - **Worktree-safe roots.** `init`, `wt` and `rm` resolve the main checkout even
